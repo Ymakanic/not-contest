@@ -1,9 +1,14 @@
-.PHONY: build run migrate kill clean
+.PHONY: build init run migrate kill clear
 
 SERVICE_NAME = app
 
 build:
 	docker-compose build || docker compose build
+
+init:
+	echo "Launching spaceship..."
+	docker-compose up --build || docker compose up --build
+	echo "Here we are, enjoy the space!"
 
 run:
 	docker-compose up || docker compose up
@@ -15,6 +20,8 @@ kill:
 	docker-compose down -v --remove-orphans --rmi local || docker compose down -v --remove-orphans --rmi local
 	docker rmi $$(docker images -q ${SERVICE_NAME}) 2>/dev/null || true
 	docker system prune -f
+	cat floppa.txt
+	echo "Done! >:)"
 
 clear: kill
 	docker volume prune -f
