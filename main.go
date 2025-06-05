@@ -21,6 +21,33 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Response structures
+type (
+	CheckoutResponse struct {
+		Message string `json:"message"`
+		Code    string `json:"code"`
+	}
+
+	PurchaseResponse struct {
+		Message string `json:"message"`
+	}
+
+	StatusResponse struct {
+		SecondsRemaining    int    `json:"seconds_remaining"`
+		SuccessfulCheckouts uint64 `json:"successful_checkouts"`
+		FailedCheckouts     uint64 `json:"failed_checkouts"`
+		SuccessfulPurchases uint64 `json:"successful_purchases"`
+		FailedPurchases     uint64 `json:"failed_purchases"`
+		ScheduledGoods      uint64 `json:"scheduled_goods"`
+		PurchasedGoods      uint64 `json:"purchased_goods"`
+		SaleStatus          string `json:"sale_status"`
+	}
+
+	ErrorResponse struct {
+		Error string `json:"error"`
+	}
+)
+
 // Global counters
 var (
 	successfulCheckouts  uint64
@@ -41,13 +68,25 @@ var (
 	reservationTimeout  int
 )
 
+func respondWithError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(ErrorResponse{Error: message})
+}
+
+func respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
 func recoverMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
 				log.Printf("Handler panic: %v", err)
 				atomic.AddUint64(&failedCheckouts, 1)
-				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				respondWithError(w, http.StatusInternalServerError, "Internal server error")
 			}
 		}()
 		next(w, r)
@@ -72,7 +111,7 @@ func requestThrottlingMiddleware(limit int, burst int) func(http.Handler) http.H
 			case <-tokenBucket:
 				next.ServeHTTP(w, r)
 			default:
-				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+				respondWithError(w, http.StatusTooManyRequests, "Too Many Requests")
 			}
 		})
 	}
@@ -89,7 +128,7 @@ func generateUniqueCode() (string, error) {
 func createReservation(ctx context.Context, userID, itemID string) (string, error) {
 	// Check if current sale is already complete
 	if atomic.LoadUint32(&currentSaleConfirmed) == 1 {
-		return "", fmt.Errorf("Sale completed, items sold out")
+		return "", fmt.Errorf("sale completed, items sold out")
 	}
 
 	now := float64(time.Now().Unix())
@@ -97,7 +136,16 @@ func createReservation(ctx context.Context, userID, itemID string) (string, erro
 
 	globalKey := "reservations:global"
 	userKey := fmt.Sprintf("reservations:user:%s", userID)
+	itemKey := fmt.Sprintf("item_reservation:%s", itemID)
 
+	// Check if item is already reserved
+	if exists, err := redisClient.Exists(ctx, itemKey).Result(); err != nil {
+		return "", err
+	} else if exists == 1 {
+		return "", fmt.Errorf("item already reserved")
+	}
+
+	// Cleanup expired reservations
 	if err := redisClient.ZRemRangeByScore(ctx, globalKey, "-inf", fmt.Sprintf("%f", now)).Err(); err != nil {
 		return "", err
 	}
@@ -105,12 +153,13 @@ func createReservation(ctx context.Context, userID, itemID string) (string, erro
 		return "", err
 	}
 
+	// Check global and user limits
 	globalCount, err := redisClient.ZCard(ctx, globalKey).Result()
 	if err != nil {
 		return "", err
 	}
 	if globalCount >= 10000 {
-		return "", fmt.Errorf("Sale completed, items sold out")
+		return "", fmt.Errorf("sale completed, items sold out")
 	}
 
 	userCount, err := redisClient.ZCard(ctx, userKey).Result()
@@ -118,139 +167,183 @@ func createReservation(ctx context.Context, userID, itemID string) (string, erro
 		return "", err
 	}
 	if userCount >= 10 {
-		return "", fmt.Errorf("Purchase limit exceeded for this user")
+		return "", fmt.Errorf("purchase limit exceeded for this user")
 	}
 
+	// Generate unique reservation code
 	code, err := generateUniqueCode()
 	if err != nil {
 		return "", err
 	}
 
-	if err := redisClient.ZAdd(ctx, globalKey, &redis.Z{Score: expireAt, Member: code}).Err(); err != nil {
-		return "", err
+	// Atomically reserve the item
+	txf := func(tx *redis.Tx) error {
+		// Check if item was reserved while we were processing
+		if exists, err := tx.Exists(ctx, itemKey).Result(); err != nil {
+			return err
+		} else if exists == 1 {
+			return fmt.Errorf("item reservation conflict")
+		}
+
+		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.SetEX(ctx, itemKey, code, time.Duration(reservationTimeout)*time.Second)
+			pipe.ZAdd(ctx, globalKey, &redis.Z{Score: expireAt, Member: code})
+			pipe.ZAdd(ctx, userKey, &redis.Z{Score: expireAt, Member: code})
+			pipe.Set(ctx, fmt.Sprintf("reservation:%s", code), 
+				fmt.Sprintf("%s|%s", userID, itemID), 
+				time.Duration(reservationTimeout)*time.Second)
+			return nil
+		})
+		return err
 	}
-	if err := redisClient.ZAdd(ctx, userKey, &redis.Z{Score: expireAt, Member: code}).Err(); err != nil {
-		redisClient.ZRem(ctx, globalKey, code)
+
+	// Retry transaction if key changed
+	for i := 0; i < 3; i++ {
+		err := redisClient.Watch(ctx, txf, itemKey)
+		if err == nil {
+			// Success
+			return code, nil
+		}
+		if err == redis.TxFailedErr {
+			// Conflict, retry
+			continue
+		}
 		return "", err
 	}
 
-	reservationKey := fmt.Sprintf("reservation:%s", code)
-	val := fmt.Sprintf("%s|%s", userID, itemID)
-	if err := redisClient.Set(ctx, reservationKey, val, time.Duration(reservationTimeout)*time.Second).Err(); err != nil {
-		redisClient.ZRem(ctx, globalKey, code)
-		redisClient.ZRem(ctx, userKey, code)
-		return "", err
-	}
-	return code, nil
+	return "", fmt.Errorf("item reservation failed after retries")
 }
 
 func checkout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		respondWithError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
+
 	userID := r.URL.Query().Get("user_id")
 	itemID := r.URL.Query().Get("id")
 	if userID == "" || itemID == "" {
 		atomic.AddUint64(&failedCheckouts, 1)
-		http.Error(w, "Missing user_id or id parameters", http.StatusBadRequest)
+		respondWithError(w, http.StatusBadRequest, "Missing user_id or id parameters")
 		return
 	}
+
 	ctx := r.Context()
 	code, err := createReservation(ctx, userID, itemID)
 	if err != nil {
 		log.Printf("Reservation error: %v", err)
 		atomic.AddUint64(&failedCheckouts, 1)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	sqlInsert := `INSERT INTO checkout_attempts (user_id, item_id, code) VALUES ($1, $2, $3)`
 	if _, err := dbPool.Exec(ctx, sqlInsert, userID, itemID, code); err != nil {
 		log.Printf("Error saving checkout_attempt: %v", err)
 		atomic.AddUint64(&failedCheckouts, 1)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
+
 	atomic.AddUint64(&successfulCheckouts, 1)
 	atomic.AddUint64(&scheduledGoods, 1)
-	fmt.Fprintf(w, "Your reservation code: %s\n", code)
+	respondWithJSON(w, http.StatusOK, CheckoutResponse{
+		Message: "Reservation successful",
+		Code:    code,
+	})
 }
 
 func purchase(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		respondWithError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
+
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		atomic.AddUint64(&failedPurchases, 1)
-		http.Error(w, "Missing code parameter", http.StatusBadRequest)
+		respondWithError(w, http.StatusBadRequest, "Missing code parameter")
 		return
 	}
+
 	ctx := r.Context()
 	reservationKey := fmt.Sprintf("reservation:%s", code)
 	val, err := redisClient.Get(ctx, reservationKey).Result()
 	if err == redis.Nil {
 		atomic.AddUint64(&failedPurchases, 1)
-		http.Error(w, "Reservation not found or expired", http.StatusBadRequest)
+		respondWithError(w, http.StatusBadRequest, "Reservation not found or expired")
 		return
 	} else if err != nil {
 		atomic.AddUint64(&failedPurchases, 1)
-		http.Error(w, "Redis error", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Redis error")
 		return
 	}
+
 	parts := strings.Split(val, "|")
 	if len(parts) != 2 {
 		atomic.AddUint64(&failedPurchases, 1)
-		http.Error(w, "Invalid reservation data format", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Invalid reservation data format")
 		return
 	}
+
 	userID := parts[0]
 	itemID := parts[1]
 
+	// Release item reservation
+	itemKey := fmt.Sprintf("item_reservation:%s", itemID)
+	redisClient.Del(ctx, itemKey)
+
+	// Cleanup reservation data
 	globalKey := "reservations:global"
 	userKey := fmt.Sprintf("reservations:user:%s", userID)
 	redisClient.ZRem(ctx, globalKey, code)
 	redisClient.ZRem(ctx, userKey, code)
 	redisClient.Del(ctx, reservationKey)
 
+	// Process purchase in database
 	tx, err := dbPool.Begin(ctx)
 	if err != nil {
 		log.Printf("Transaction begin error: %v", err)
 		atomic.AddUint64(&failedPurchases, 1)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
 	defer tx.Rollback(ctx)
+
 	sqlInsertSale := `INSERT INTO sales (user_id, item_id, status) VALUES ($1, $2, 'pending')`
 	if _, err := tx.Exec(ctx, sqlInsertSale, userID, itemID); err != nil {
 		log.Printf("Sales insert error: %v", err)
 		atomic.AddUint64(&failedPurchases, 1)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
+
 	sqlUpdateCheckout := `UPDATE checkout_attempts SET used = true WHERE code = $1`
 	if _, err := tx.Exec(ctx, sqlUpdateCheckout, code); err != nil {
 		log.Printf("Checkout update error: %v", err)
 		atomic.AddUint64(&failedPurchases, 1)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
+
 	if err := tx.Commit(ctx); err != nil {
 		log.Printf("Transaction commit error: %v", err)
 		atomic.AddUint64(&failedPurchases, 1)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
+
 	atomic.AddUint64(&successfulPurchases, 1)
 	atomic.AddUint64(&purchasedGoods, 1)
-	fmt.Fprintf(w, "Provisional purchase confirmed for user %s, item %s\n", userID, itemID)
+	respondWithJSON(w, http.StatusOK, PurchaseResponse{
+		Message: fmt.Sprintf("Provisional purchase confirmed for user %s, item %s", userID, itemID),
+	})
 }
 
 func finalizeSales(ctx context.Context) error {
 	tx, err := dbPool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("Transaction begin error: %w", err)
+		return fmt.Errorf("transaction begin error: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	
@@ -266,7 +359,7 @@ func finalizeSales(ctx context.Context) error {
 		AND purchased_at < $2`
 	
 	if err := tx.QueryRow(ctx, sqlCount, prevHour, prevHourEnd).Scan(&pendingCount); err != nil {
-		return fmt.Errorf("Pending sales count error: %w", err)
+		return fmt.Errorf("pending sales count error: %w", err)
 	}
 	
 	if pendingCount == 10000 {
@@ -276,7 +369,7 @@ func finalizeSales(ctx context.Context) error {
 			AND purchased_at >= $1 
 			AND purchased_at < $2`
 		if _, err := tx.Exec(ctx, sqlConfirm, prevHour, prevHourEnd); err != nil {
-			return fmt.Errorf("Sales confirmation error: %w", err)
+			return fmt.Errorf("sales confirmation error: %w", err)
 		}
 		log.Println("Sales confirmed - exactly 10000 orders")
 		atomic.StoreUint32(&currentSaleConfirmed, 1)
@@ -286,13 +379,13 @@ func finalizeSales(ctx context.Context) error {
 			AND purchased_at >= $1 
 			AND purchased_at < $2`
 		if _, err := tx.Exec(ctx, sqlDelete, prevHour, prevHourEnd); err != nil {
-			return fmt.Errorf("Pending sales deletion error: %w", err)
+			return fmt.Errorf("pending sales deletion error: %w", err)
 		}
 		log.Printf("Provisional sales count (%d) not equal to 10000. Sales canceled\n", pendingCount)
 	}
 	
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("Transaction commit error: %w", err)
+		return fmt.Errorf("transaction commit error: %w", err)
 	}
 	
 	// Reset metrics for new sale
@@ -319,7 +412,7 @@ func resetRedis(ctx context.Context) error {
 		return err
 	}
 	
-	// Clear user reservations (pattern delete)
+	// Clear user reservations
 	iter := redisClient.Scan(ctx, 0, "reservations:user:*", 0).Iterator()
 	for iter.Next(ctx) {
 		if err := redisClient.Del(ctx, iter.Val()).Err(); err != nil {
@@ -337,6 +430,14 @@ func resetRedis(ctx context.Context) error {
 			log.Printf("Error deleting key %s: %v", iter.Val(), err)
 		}
 	}
+	
+	// Clear item reservations
+	iter = redisClient.Scan(ctx, 0, "item_reservation:*", 0).Iterator()
+	for iter.Next(ctx) {
+		if err := redisClient.Del(ctx, iter.Val()).Err(); err != nil {
+			log.Printf("Error deleting key %s: %v", iter.Val(), err)
+		}
+	}
 	return iter.Err()
 }
 
@@ -345,18 +446,16 @@ func status(w http.ResponseWriter, r *http.Request) {
 	nextHour := now.Truncate(time.Hour).Add(time.Hour)
 	secondsRemaining := int(nextHour.Sub(now).Seconds())
 	
-	resp := map[string]interface{}{
-		"seconds_remaining":   secondsRemaining,
-		"successful_checkouts": atomic.LoadUint64(&successfulCheckouts),
-		"failed_checkouts":     atomic.LoadUint64(&failedCheckouts),
-		"successful_purchases": atomic.LoadUint64(&successfulPurchases),
-		"failed_purchases":     atomic.LoadUint64(&failedPurchases),
-		"scheduled_goods":      atomic.LoadUint64(&scheduledGoods),
-		"purchased_goods":      atomic.LoadUint64(&purchasedGoods),
-		"sale_status":          saleStatusText(),
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	respondWithJSON(w, http.StatusOK, StatusResponse{
+		SecondsRemaining:    secondsRemaining,
+		SuccessfulCheckouts: atomic.LoadUint64(&successfulCheckouts),
+		FailedCheckouts:     atomic.LoadUint64(&failedCheckouts),
+		SuccessfulPurchases: atomic.LoadUint64(&successfulPurchases),
+		FailedPurchases:     atomic.LoadUint64(&failedPurchases),
+		ScheduledGoods:      atomic.LoadUint64(&scheduledGoods),
+		PurchasedGoods:      atomic.LoadUint64(&purchasedGoods),
+		SaleStatus:          saleStatusText(),
+	})
 }
 
 func saleStatusText() string {
