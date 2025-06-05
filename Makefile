@@ -8,7 +8,8 @@ build:
 init:
 	echo "Launching spaceship..."
 	docker-compose up --build || docker compose up --build
-	echo "Here we are, enjoy the space!"
+	cat floppa.txt
+	echo "Done! >:)"
 
 run:
 	docker-compose up || docker compose up
