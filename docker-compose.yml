@@ -6,7 +6,6 @@ services:
     environment:
       RESERVATION_TIMEOUT: 3600
       PORT: 8080
-      RESERVATION_TIMEOUT: 600
       PG_USER: postgres
       PG_PASSWORD: postgres
       PG_HOST: postgres
