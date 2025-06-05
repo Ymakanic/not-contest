@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,13 +21,24 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Global counters
 var (
-	dbPool            *pgxpool.Pool
-	redisClient       *redis.Client
-	port              string
-	certFile          string
-	keyFile           string
-	reservationTimeout int
+	successfulCheckouts  uint64
+	failedCheckouts      uint64
+	successfulPurchases  uint64
+	failedPurchases      uint64
+	scheduledGoods       uint64
+	purchasedGoods       uint64
+	currentSaleConfirmed uint32 // Atomic flag for sale status
+)
+
+var (
+	dbPool              *pgxpool.Pool
+	redisClient         *redis.Client
+	port                string
+	certFile            string
+	keyFile             string
+	reservationTimeout  int
 )
 
 func recoverMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -34,6 +46,7 @@ func recoverMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		defer func() {
 			if err := recover(); err != nil {
 				log.Printf("Handler panic: %v", err)
+				atomic.AddUint64(&failedCheckouts, 1)
 				http.Error(w, "Internal server error", http.StatusInternalServerError)
 			}
 		}()
@@ -74,6 +87,11 @@ func generateUniqueCode() (string, error) {
 }
 
 func createReservation(ctx context.Context, userID, itemID string) (string, error) {
+	// Check if current sale is already complete
+	if atomic.LoadUint32(&currentSaleConfirmed) == 1 {
+		return "", fmt.Errorf("Sale completed, items sold out")
+	}
+
 	now := float64(time.Now().Unix())
 	expireAt := now + float64(reservationTimeout)
 
@@ -134,6 +152,7 @@ func checkout(w http.ResponseWriter, r *http.Request) {
 	userID := r.URL.Query().Get("user_id")
 	itemID := r.URL.Query().Get("id")
 	if userID == "" || itemID == "" {
+		atomic.AddUint64(&failedCheckouts, 1)
 		http.Error(w, "Missing user_id or id parameters", http.StatusBadRequest)
 		return
 	}
@@ -141,15 +160,19 @@ func checkout(w http.ResponseWriter, r *http.Request) {
 	code, err := createReservation(ctx, userID, itemID)
 	if err != nil {
 		log.Printf("Reservation error: %v", err)
+		atomic.AddUint64(&failedCheckouts, 1)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	sqlInsert := `INSERT INTO checkout_attempts (user_id, item_id, code) VALUES ($1, $2, $3)`
 	if _, err := dbPool.Exec(ctx, sqlInsert, userID, itemID, code); err != nil {
 		log.Printf("Error saving checkout_attempt: %v", err)
+		atomic.AddUint64(&failedCheckouts, 1)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+	atomic.AddUint64(&successfulCheckouts, 1)
+	atomic.AddUint64(&scheduledGoods, 1)
 	fmt.Fprintf(w, "Your reservation code: %s\n", code)
 }
 
@@ -160,6 +183,7 @@ func purchase(w http.ResponseWriter, r *http.Request) {
 	}
 	code := r.URL.Query().Get("code")
 	if code == "" {
+		atomic.AddUint64(&failedPurchases, 1)
 		http.Error(w, "Missing code parameter", http.StatusBadRequest)
 		return
 	}
@@ -167,14 +191,17 @@ func purchase(w http.ResponseWriter, r *http.Request) {
 	reservationKey := fmt.Sprintf("reservation:%s", code)
 	val, err := redisClient.Get(ctx, reservationKey).Result()
 	if err == redis.Nil {
+		atomic.AddUint64(&failedPurchases, 1)
 		http.Error(w, "Reservation not found or expired", http.StatusBadRequest)
 		return
 	} else if err != nil {
+		atomic.AddUint64(&failedPurchases, 1)
 		http.Error(w, "Redis error", http.StatusInternalServerError)
 		return
 	}
 	parts := strings.Split(val, "|")
 	if len(parts) != 2 {
+		atomic.AddUint64(&failedPurchases, 1)
 		http.Error(w, "Invalid reservation data format", http.StatusInternalServerError)
 		return
 	}
@@ -190,6 +217,7 @@ func purchase(w http.ResponseWriter, r *http.Request) {
 	tx, err := dbPool.Begin(ctx)
 	if err != nil {
 		log.Printf("Transaction begin error: %v", err)
+		atomic.AddUint64(&failedPurchases, 1)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -197,20 +225,25 @@ func purchase(w http.ResponseWriter, r *http.Request) {
 	sqlInsertSale := `INSERT INTO sales (user_id, item_id, status) VALUES ($1, $2, 'pending')`
 	if _, err := tx.Exec(ctx, sqlInsertSale, userID, itemID); err != nil {
 		log.Printf("Sales insert error: %v", err)
+		atomic.AddUint64(&failedPurchases, 1)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 	sqlUpdateCheckout := `UPDATE checkout_attempts SET used = true WHERE code = $1`
 	if _, err := tx.Exec(ctx, sqlUpdateCheckout, code); err != nil {
 		log.Printf("Checkout update error: %v", err)
+		atomic.AddUint64(&failedPurchases, 1)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 	if err := tx.Commit(ctx); err != nil {
 		log.Printf("Transaction commit error: %v", err)
+		atomic.AddUint64(&failedPurchases, 1)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+	atomic.AddUint64(&successfulPurchases, 1)
+	atomic.AddUint64(&purchasedGoods, 1)
 	fmt.Fprintf(w, "Provisional purchase confirmed for user %s, item %s\n", userID, itemID)
 }
 
@@ -220,44 +253,117 @@ func finalizeSales(ctx context.Context) error {
 		return fmt.Errorf("Transaction begin error: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	
+	// Get the previous hour's boundaries
+	now := time.Now()
+	prevHour := now.Truncate(time.Hour).Add(-time.Hour)
+	prevHourEnd := prevHour.Add(time.Hour)
+	
 	var pendingCount int
-	sqlCount := `SELECT COUNT(*) FROM sales WHERE status = 'pending' AND purchased_at >= date_trunc('hour', now())`
-	if err := tx.QueryRow(ctx, sqlCount).Scan(&pendingCount); err != nil {
+	sqlCount := `SELECT COUNT(*) FROM sales 
+		WHERE status = 'pending' 
+		AND purchased_at >= $1 
+		AND purchased_at < $2`
+	
+	if err := tx.QueryRow(ctx, sqlCount, prevHour, prevHourEnd).Scan(&pendingCount); err != nil {
 		return fmt.Errorf("Pending sales count error: %w", err)
 	}
+	
 	if pendingCount == 10000 {
-		sqlConfirm := `UPDATE sales SET status = 'confirmed', committed_at = now() WHERE status = 'pending' AND purchased_at >= date_trunc('hour', now())`
-		if _, err := tx.Exec(ctx, sqlConfirm); err != nil {
+		sqlConfirm := `UPDATE sales 
+			SET status = 'confirmed', committed_at = now() 
+			WHERE status = 'pending' 
+			AND purchased_at >= $1 
+			AND purchased_at < $2`
+		if _, err := tx.Exec(ctx, sqlConfirm, prevHour, prevHourEnd); err != nil {
 			return fmt.Errorf("Sales confirmation error: %w", err)
 		}
 		log.Println("Sales confirmed - exactly 10000 orders")
+		atomic.StoreUint32(&currentSaleConfirmed, 1)
 	} else {
-		sqlDelete := `DELETE FROM sales WHERE status = 'pending' AND purchased_at >= date_trunc('hour', now())`
-		if _, err := tx.Exec(ctx, sqlDelete); err != nil {
+		sqlDelete := `DELETE FROM sales 
+			WHERE status = 'pending' 
+			AND purchased_at >= $1 
+			AND purchased_at < $2`
+		if _, err := tx.Exec(ctx, sqlDelete, prevHour, prevHourEnd); err != nil {
 			return fmt.Errorf("Pending sales deletion error: %w", err)
 		}
 		log.Printf("Provisional sales count (%d) not equal to 10000. Sales canceled\n", pendingCount)
 	}
+	
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("Transaction commit error: %w", err)
 	}
+	
+	// Reset metrics for new sale
+	atomic.StoreUint64(&successfulCheckouts, 0)
+	atomic.StoreUint64(&failedCheckouts, 0)
+	atomic.StoreUint64(&successfulPurchases, 0)
+	atomic.StoreUint64(&failedPurchases, 0)
+	atomic.StoreUint64(&scheduledGoods, 0)
+	atomic.StoreUint64(&purchasedGoods, 0)
+	atomic.StoreUint32(&currentSaleConfirmed, 0)
+	
+	// Clear Redis for new sale
+	if err := resetRedis(ctx); err != nil {
+		log.Printf("Redis reset error: %v", err)
+	}
+	
 	return nil
 }
 
-func timerHandler(w http.ResponseWriter, r *http.Request) {
+func resetRedis(ctx context.Context) error {
+	// Clear global reservations
+	globalKey := "reservations:global"
+	if err := redisClient.Del(ctx, globalKey).Err(); err != nil {
+		return err
+	}
+	
+	// Clear user reservations (pattern delete)
+	iter := redisClient.Scan(ctx, 0, "reservations:user:*", 0).Iterator()
+	for iter.Next(ctx) {
+		if err := redisClient.Del(ctx, iter.Val()).Err(); err != nil {
+			log.Printf("Error deleting key %s: %v", iter.Val(), err)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return err
+	}
+	
+	// Clear reservation details
+	iter = redisClient.Scan(ctx, 0, "reservation:*", 0).Iterator()
+	for iter.Next(ctx) {
+		if err := redisClient.Del(ctx, iter.Val()).Err(); err != nil {
+			log.Printf("Error deleting key %s: %v", iter.Val(), err)
+		}
+	}
+	return iter.Err()
+}
+
+func status(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	nextHour := now.Truncate(time.Hour).Add(time.Hour)
 	secondsRemaining := int(nextHour.Sub(now).Seconds())
+	
 	resp := map[string]interface{}{
-		"seconds_remaining": secondsRemaining,
+		"seconds_remaining":   secondsRemaining,
+		"successful_checkouts": atomic.LoadUint64(&successfulCheckouts),
+		"failed_checkouts":     atomic.LoadUint64(&failedCheckouts),
+		"successful_purchases": atomic.LoadUint64(&successfulPurchases),
+		"failed_purchases":     atomic.LoadUint64(&failedPurchases),
+		"scheduled_goods":      atomic.LoadUint64(&scheduledGoods),
+		"purchased_goods":      atomic.LoadUint64(&purchasedGoods),
+		"sale_status":          saleStatusText(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-func status(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, "OK")
+func saleStatusText() string {
+	if atomic.LoadUint32(&currentSaleConfirmed) == 1 {
+		return "completed"
+	}
+	return "active"
 }
 
 func scheduleFinalization() {
@@ -349,12 +455,14 @@ func main() {
 		log.Fatalf("Database init error: %v", err)
 	}
 
+	// Initialize sale status
+	atomic.StoreUint32(&currentSaleConfirmed, 0)
+
 	go scheduleFinalization()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/checkout", recoverMiddleware(checkout))
 	mux.HandleFunc("/purchase", recoverMiddleware(purchase))
-	mux.HandleFunc("/timer", recoverMiddleware(timerHandler))
 	mux.HandleFunc("/status", recoverMiddleware(status))
 
 	handlerWithThrottle := requestThrottlingMiddleware(10, 20)(mux)
