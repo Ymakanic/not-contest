@@ -30,6 +30,8 @@ type (
 
 	PurchaseResponse struct {
 		Message string `json:"message"`
+		User string `json:"user"`
+		Item string `json:"item"`
 	}
 
 	StatusResponse struct {
@@ -248,7 +250,7 @@ func checkout(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&successfulCheckouts, 1)
 	atomic.AddUint64(&scheduledGoods, 1)
 	respondWithJSON(w, http.StatusOK, CheckoutResponse{
-		Message: "Reservation successful",
+		Message: "success",
 		Code:    code,
 	})
 }
@@ -336,7 +338,9 @@ func purchase(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&successfulPurchases, 1)
 	atomic.AddUint64(&purchasedGoods, 1)
 	respondWithJSON(w, http.StatusOK, PurchaseResponse{
-		Message: fmt.Sprintf("Provisional purchase confirmed for user %s, item %s", userID, itemID),
+		Message: "success",
+		User: userID,
+		Item: itemID,
 	})
 }
 
