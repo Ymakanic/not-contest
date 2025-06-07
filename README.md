@@ -5,14 +5,14 @@ First clone this repository to your machine:\
 
 Then open repository folder:\
 `cd not-contest && ls`\
-We can see main files, files used for building and .env file which contains app configuration. You can leave it as is, it will work the same. If not you can change ports, db users etc.
+We can see main files, files used for building and YAML file which contains app configuration. You can leave it as is, it will work the same. If not you can change ports, db users etc.
 
 Then we'll create separated terminal instance to run container in background:\
 `screen -S flashsale`\
 Or other method if you prefer.\
 When you see clear terminal we're ready to build. We'll make it using following command:\
 `make init`\
-Now application will built, including databases and tables, you only need enjoy watching it). Isn't it awesome?\
+Now application will be built, including databases and tables, you only need enjoy watching it). Isn't it awesome?\
 Once app is build you can detach separated terminal using `Ctrl + A + D`
 
 ### Now our app is listening port 8080 (if you did not change that) and accepts 3 methods:
